@@ -29,7 +29,7 @@ crawlAndShot({
         outputDir: './results',
         // screen shot any additional URLs not gathered from crawling
         additionalUrls: [
-            'http://research.ecosounds.org/'
+            'http://subdomain.example.org/contact.html'
         ],
         routeDecisions: [
             {
