@@ -49,12 +49,12 @@ crawlAndShot({
                 allow: false
             },
             {
-                // this allow only the first 10 links to single blog posts
+                // this allows only the first 10 links to single blog posts
                 // to be crawled. With many items this allows for a snapshot
                 // of different pages with different content, without capturing
                 // the entire site
                 match: /^\/posts\/(\d+).*/,
-                limit: 2
+                limit: 10
             },
         ]
     },
