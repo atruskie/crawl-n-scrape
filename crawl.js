@@ -3,6 +3,7 @@
  */
 'use strict';
 const phantomAPI = require('phantom');
+const createPhantomPool = require('phantom-pool').default;
 const Crawler = require('simplecrawler');
 const chalk = require('chalk');
 const phantomjs = require('phantomjs-prebuilt');
@@ -10,6 +11,7 @@ const logSymbols = require('log-symbols');
 const promiseFinally = require('promise.prototype.finally');
 const hardRejection = require('hard-rejection')();
 const delay = require('delay');
+const pLimit = require('p-limit');
 const jsonfile = require('jsonfile');
 
 
@@ -28,6 +30,7 @@ module.exports = crawl;
 const phantomBin = phantomjs.path;
 
 function crawl(options, complete) {
+    var idleTime = 10 * 60; // 10 minutes
 
     // set up black listing
     var extensionLinks = new Set();
@@ -42,7 +45,7 @@ function crawl(options, complete) {
     crawler.interval = 200;
     crawler.maxConcurrency = 1;
     crawler.maxDepth = 0; // 0 == unlimited
-    crawler.listenerTTL = 10 * 60 * 1000; // 10 minutes
+    crawler.listenerTTL = idleTime * 1000; // 10 minutes
     // if set add a cookie to all requests
     if (options.cookie) {
         crawler.cookies.addFromHeaders(options.cookie);
@@ -76,23 +79,20 @@ function crawl(options, complete) {
     crawler.emit = newEmit;
 
     // start the run
-    var phantom;
+    var phantomPool;
     let phantomArgs = ['--load-images=no', '--disk-cache=true'];
     if (options.verbose) {
         phantomArgs.push('--debug=true');
     }
-    var runner = phantomAPI
-        .create(phantomArgs, {binary: phantomBin, logLevel: options.verbose ? 'debug' : 'error'})
-        .then(runCrawler)
-        .catch(function (exception) {
-            console.log(logSymbols.error + chalk.red(" Promise Rejected\n") + exception.toString());
-            if (phantom) {
-                phantom.exit();
-            }
-        });
 
-    function runCrawler(_phantom) {
-        phantom = _phantom;
+    runCrawler();
+
+    function runCrawler() {
+        phantomPool = getPhantomPool(
+            phantomArgs,
+            {binary: phantomBin, logLevel: options.verbose ? 'debug' : 'error'},
+            idleTime
+        );
         console.log(logSymbols.info + ' Running crawler');
         crawler.start();
     }
@@ -110,7 +110,7 @@ function crawl(options, complete) {
         });
 
         console.log(chalk.yellow("Killing phantom"));
-        phantom.exit();
+        phantomPool.drain().then(() => phantomPool.clear());
 
         complete(null, items);
 
@@ -213,7 +213,7 @@ function crawl(options, complete) {
         console.log(logSymbols.info + ' [discover] Discovering resources — ', queueItem.url);
 
         let resume = this.wait();
-        getLinks(phantom, queueItem)
+        getLinks(queueItem)
             .then((foundLinks) => {
                 //console.info(logSymbols.info + ' [discover] Found these links: - %s\n', queueItem.url, foundLinks);
 
@@ -249,67 +249,95 @@ function crawl(options, complete) {
     }
 
 
-    function getLinks(phantom, queueItem) {
+    function getLinks(queueItem) {
         console.log(chalk.green('Phantom') + ' attempting to load — ' + queueItem.url);
 
         var page;
-        return phantom
-            .createPage()
-            .then(function (_page) {
-                console.log(chalk.green('Phantom') + ' visiting page ', queueItem.url);
-                page = _page;
 
-                // phantom is super fussy about its cookies
-                var cookies = crawler.cookies.get(); //'_AWB_session'
-                //console.log(chalk.green('Phantom') + 'setting cookies:', cookies);
-                return Promise
-                    .all(cookies.map(c => {
-                        // needs to be a valid date int
-                        c.expires = +(new Date((new Date().getFullYear()) + 10, 1, 1));
-                        c.domain = queueItem.host;
-                        return page.addCookie(c);
-                    }))
-                    // also https://github.com/ariya/phantomjs/issues/14047 means we can't even tell if it has worked!
-                    // so query the cookie jar instead
-                    .then(() => page.property('cookies'));
-            })
-            .then(function (cookies) {
-                //console.log(chalk.green('Phantom') + ' cookie set result', cookies);
-                if (!cookies || cookies.length === 0) {
-                    throw new Error("Failed to set PhantomJS Cookies");
-                }
-                console.log(chalk.green('Phantom') + ' %s cookies set — ' + queueItem.url, chalk.magenta(cookies.length));
+        return phantomPool.use((phantom) => {
+            return phantom
+                .createPage()
+                .then(function (_page) {
+                    console.log(chalk.green('Phantom') + ' visiting page ', queueItem.url);
+                    page = _page;
 
-                return page.open(queueItem.url);
-            })
-            .then(function (status) {
-                if (status !== "success") {
-                    console.log(chalk.green('Phantom') + ' unable to open URL — ' + queueItem.url);
-                    throw new Error('Phantom unable to open URL — ' + queueItem.url);
-                }
-                else {
-                    console.log(chalk.green('Phantom') + ' opened URL with %s — ' + queueItem.url, status);
-                }
+                    // phantom is super fussy about its cookies
+                    var cookies = crawler.cookies.get(); //'_AWB_session'
+                    //console.log(chalk.green('Phantom') + 'setting cookies:', cookies);
+                    return Promise
+                        .all(cookies.map(c => {
+                            // needs to be a valid date int
+                            c.expires = +(new Date((new Date().getFullYear()) + 10, 1, 1));
+                            c.domain = queueItem.host;
+                            return page.addCookie(c);
+                        }))
+                        // also https://github.com/ariya/phantomjs/issues/14047 means we can't even tell if it has worked!
+                        // so query the cookie jar instead
+                        .then(() => page.property('cookies'));
+                })
+                .then(function (cookies) {
+                    //console.log(chalk.green('Phantom') + ' cookie set result', cookies);
+                    if (!cookies || cookies.length === 0) {
+                        throw new Error("Failed to set PhantomJS Cookies");
+                    }
+                    console.log(chalk.green('Phantom') + ' %s cookies set — ' + queueItem.url, chalk.magenta(cookies.length));
 
-                return delay(1000).then(()=> page.evaluate(isAngular));
-            })
-            .then(function (isAngular) {
-                console.log(chalk.green('Phantom') + ' page loaded is angular app? %s — ' + queueItem.url, isAngular);
-                return delay(isAngular ? options.delay * 1000 : 0);
-            })
-            .then(function () {
-                return page.evaluate(findPageLinks);
-            })
-            .then(function (result) {
-                let count = result.length === 0 ? chalk.red('0') : chalk.magenta(result.length);
-                console.log(chalk.green('Phantom') + ' discovered %s URLs from — ' + queueItem.url, count);
-                page.close();
-                return result;
-            })
-            .catch(function (error) {
-                console.log(chalk.green('Phantom') + chalk.red('ERROR'), error);
-                throw error;
-            });
+                    return page.open(queueItem.url);
+                })
+                .then(function (status) {
+                    if (status !== "success") {
+                        console.log(chalk.green('Phantom') + ' unable to open URL — ' + queueItem.url);
+                        throw new Error('Phantom unable to open URL — ' + queueItem.url);
+                    }
+                    else {
+                        console.log(chalk.green('Phantom') + ' opened URL with %s — ' + queueItem.url, status);
+                    }
+
+                    return delay(1000).then(()=> page.evaluate(isAngular));
+                })
+                .then(function (isAngular) {
+                    console.log(chalk.green('Phantom') + ' page loaded is angular app? %s — ' + queueItem.url, isAngular);
+                    return delay(isAngular ? options.delay * 1000 : 0);
+                })
+                .then(function () {
+                    return page.evaluate(findPageLinks);
+                })
+                .then(function (result) {
+                    let count = result.length === 0 ? chalk.red('0') : chalk.magenta(result.length);
+                    console.log(chalk.green('Phantom') + ' discovered %s URLs from — ' + queueItem.url, count);
+                    page.close();
+                    return result;
+                })
+                .catch(function (error) {
+                    console.log(chalk.green('Phantom') + chalk.red('ERROR'), error);
+                    try {
+                        page.close();
+                    }
+                    catch (error) {
+                        console.log("Could not close phantom page", error);
+                    }
+                    throw error;
+                });
+        });
+    }
+
+    function getPhantomPool(phantomArgs, phantomOptions, idle) {
+        const pool = createPhantomPool({
+            max: 10, // default
+            min: 2, // default
+            // how long a resource can stay idle in pool before being removed
+            idleTimeoutMillis: idle * 1000,
+            // maximum number of times an individual resource can be reused before being destroyed; set to 0 to disable
+            maxUses: 50, // default
+            // function to validate an instance prior to use; see https://github.com/coopernurse/node-pool#createpool
+            validator: () => Promise.resolve(true), // defaults to always resolving true
+            // validate resource before borrowing; required for `maxUses and `validator`
+            testOnBorrow: true, // default
+
+            phantomArgs: [phantomArgs, phantomOptions]
+        });
+
+        return pool;
     }
 
     function findPageLinks() {
